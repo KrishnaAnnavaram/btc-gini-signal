@@ -1,0 +1,27 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data: price files are never committed (see data/README.md)
+/data/*
+!/data/README.md
+
+# run outputs and models
+/outputs/
+/models/
+/reports/
+*.joblib
+*.pkl
+*.db
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
