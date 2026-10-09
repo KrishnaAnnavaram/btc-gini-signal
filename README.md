@@ -69,6 +69,7 @@ This README is the **one location that explains all of btc-gini-signal**. It giv
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one forecast](#42-the-life-cycle-of-one-forecast)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Price data and validation](#5-price-data-and-validation)
 6. 🟢 [Features and targets](#6-features-and-targets)
 7. 🟣 [Models and the walk-forward evaluation](#7-models-and-the-walk-forward-evaluation)
@@ -132,6 +133,47 @@ flowchart LR
 | Report | `src/btc_gini_signal/report.py` | `report.md` and `results.json` |
 | CLI | `src/btc_gini_signal/cli.py` | The `btc-gini-signal` command with 7 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>7 subcommands"]
+    end
+    subgraph DATAIN["Data in"]
+        CFG["config.py<br/>Settings, parse_horizons"]
+        DATA["data.py<br/>CSVSource, CoinbaseSource,<br/>SyntheticSource, load, validate"]
+        SYN["synthetic.py<br/>generate"]
+    end
+    subgraph FEAT["Features"]
+        BLD["features/build.py<br/>build_features, make_target"]
+        INQ["features/inequality.py<br/>rolling_gini_kolkata"]
+    end
+    subgraph EVAL["Evaluation"]
+        STU["study.py<br/>run_study"]
+        WF["walkforward.py<br/>walk_forward"]
+        MOD["models.py<br/>MODELS, ModelSpec"]
+        MET["metrics.py<br/>summarize, diebold_mariano,<br/>backtest_sign"]
+        FC["forecast.py<br/>direct_forecast"]
+    end
+    REP["report.py<br/>write"]
+
+    CLI --> CFG
+    CLI --> DATA
+    CLI --> BLD
+    CLI --> STU
+    CLI --> FC
+    CLI --> REP
+    DATA --> SYN
+    BLD --> INQ
+    STU --> BLD
+    STU --> WF
+    STU --> MET
+    WF --> MOD
+    FC --> BLD
+    FC --> MOD
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -170,6 +212,23 @@ Each feature at day t uses closes up to day t. A test computes the features on a
 ### 3.3 The embargo
 At a refit day, the model trains only on days t with t + h on or before that refit day. Only those targets are known on that day. A test checks this rule for each refit.
 
+The diagram shows which usable days one refit at day s uses.
+
+```mermaid
+flowchart LR
+    subgraph PAST["Usable days before the refit day s"]
+        TR["Training days:<br/>t + h on or before s"]
+        EMB["Embargo: the last h − 1 days,<br/>target not known on day s"]
+    end
+    subgraph NEXT["Prediction block"]
+        PB["Usable days from s<br/>to s + refit_every − 1"]
+    end
+    TR --> FIT["Clone the model,<br/>fit on the training days"]
+    EMB -. "not used" .-> FIT
+    FIT --> PRED["Predict the block"]
+    PB --> PRED
+```
+
 ### 3.4 Scale-free inequality on a fixed window
 The Gini and Kolkata indices use the absolute log returns of the last `BTCGINI_WINDOW` days. Returns do not depend on the price level, so the features do not drift with the price. A test multiplies all prices by 1000 and checks the features.
 
@@ -189,24 +248,66 @@ The median imputer and the scaler are steps of the model pipeline. They fit agai
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    SRC["CoinbaseSource, CSVSource or SyntheticSource"] --> VAL["validate: dates, OHLC rules, gaps"]
-    VAL --> FE["build_features: base + inequality (data up to t)"]
-    VAL --> TG["make_target: r(t+h), h = 1, 7"]
-    FE --> WF["walk_forward: expanding window, refit every 30 days, embargo h"]
+flowchart TD
+    API[/"Coinbase Exchange API"/] --> FETCH["fetch: CoinbaseSource"]
+    FETCH --> RAW[("data/raw/*.csv<br/>read-only")]
+    SRC{"--data or BTCGINI_DATA"} -- "CSV path" --> CSV["CSVSource:<br/>Investing.com or generic CSV"]
+    RAW --> CSV
+    SRC -- "synthetic or empty" --> SYN["SyntheticSource:<br/>synthetic.generate"]
+    CSV --> VAL{"validate: dates,<br/>OHLC rules, gaps"}
+    SYN --> VAL
+    VAL -- "error" --> DE[/"DataError"/]
+    VAL -- "no error" --> FE["build_features:<br/>base + inequality, data up to t"]
+    VAL -- "no error" --> TG["make_target:<br/>r from t to t+h, h = 1, 7"]
+    FE --> WF["walk_forward: expanding window,<br/>refit every 30 days, embargo h"]
     TG --> WF
     WF --> M1["random walk, mean, AR(3)"]
-    WF --> M2["ridge, gbm: base and base+inequality"]
-    M1 --> MET["MAE, RMSE, R2 vs RW, direction, DM vs RW"]
+    WF --> M2["ridge, gbm:<br/>base and base+inequality"]
+    M1 --> MET["MAE, RMSE, R2 vs RW,<br/>direction, DM vs RW"]
     M2 --> MET
-    M2 --> AB["ablation: DM base vs base+inequality"]
-    M2 --> BT["sign backtest with costs (h = 1)"]
-    MET --> REP["report.md + results.json"]
+    M2 --> AB["ablation: DM base<br/>vs base+inequality"]
+    M1 -- "mean, AR(3)" --> BT["sign backtest with costs<br/>h = 1"]
+    M2 --> BT
+    MET --> REP[("outputs/<br/>report.md + results.json")]
     AB --> REP
     BT --> REP
+    REP --> HUM{{"RESEARCHER<br/>reads the pattern of the DM tests,<br/>no trading decision"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUM human
 ```
 
 ### 4.2 The life cycle of one forecast
+
+```mermaid
+stateDiagram-v2
+    state "Price row, day t" as Row
+    state "Validated row" as Valid
+    state "Feature row" as Feat
+    state "Warm-up, a feature is NaN" as Warm
+    state "No target yet" as NoTarget
+    state "Usable day" as Usable
+    state "Training day" as Train
+    state "Predicted day" as Pred
+    state "Scored day" as Scored
+    state "Backtest day" as BT
+    [*] --> Row: the loader reads the file
+    Row --> Valid: validate finds no error
+    Valid --> Feat: build_features from closes up to t
+    Feat --> Warm: too few past days for a window
+    Feat --> NoTarget: one of the last h days
+    Feat --> Usable: features complete, target observed
+    Usable --> Train: one of the first min_train usable days
+    Usable --> Pred: after the first origin
+    Pred --> Train: a later refit day s with t + h on or before s
+    Pred --> Scored: compare with the target and the random walk
+    Scored --> BT: h = 1 and the model is not random_walk
+    Warm --> [*]
+    NoTarget --> [*]
+    Train --> [*]
+    Scored --> [*]
+    BT --> [*]
+```
 
 1. The loader reads the day from the price file and validates it.
 2. The feature builder computes the base and inequality features of the day from past closes.
@@ -216,11 +317,70 @@ flowchart TB
 6. The study compares the prediction with the realised target and with the random walk.
 7. For h = 1, the backtest holds the sign of the prediction for the next day and charges the cost.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as cli.py
+    participant CFG as Settings
+    participant DATA as data.load
+    participant SRC as CSVSource or SyntheticSource
+    participant ST as study.run_study
+    participant WF as walk_forward
+    participant MET as metrics.py
+    participant REP as report.write
+    participant FS as outputs folder
+
+    R->>CLI: btc-gini-signal evaluate --data file.csv
+    CLI->>CFG: Settings.from_env, then the CLI overrides
+    CLI->>DATA: load(source_for(path))
+    DATA->>SRC: read()
+    SRC-->>DATA: canonical frame and Provenance
+    DATA->>DATA: validate: an error stops, warnings are kept
+    DATA-->>CLI: PriceData
+    CLI->>ST: run_study(data, settings, models)
+    ST->>ST: build_features, make_target for each h
+    loop each horizon, model and feature set
+        ST->>WF: walk_forward(masked features, target, model, h)
+        WF-->>ST: WalkForwardResult
+        ST->>MET: summarize, and backtest_sign for h = 1
+    end
+    ST->>MET: diebold_mariano, base+inequality against base
+    ST-->>CLI: StudyResult: rows, ablation, backtests
+    CLI-->>R: accuracy table and ablation lines
+    CLI->>REP: write(study, data, settings, out)
+    REP->>FS: report.md and results.json
+    CLI-->>R: report path and the disclaimer
+```
+
 ---
 
 ## 5. Price data and validation
 
 **Purpose.** Read daily prices from one of three sources into one canonical frame, and stop bad data.
+
+The first diagram shows how `data.load` reads and validates the prices.
+
+```mermaid
+flowchart TD
+    P{"path"} -- "None or synthetic" --> SYN["SyntheticSource.read"]
+    P -- "file path" --> FILE{"File exists?"}
+    FILE -- "no" --> FNF[/"FileNotFoundError"/]
+    FILE -- "yes" --> CSV["pd.read_csv, all cells as text"]
+    CSV --> LAY{"Layout"}
+    LAY -- "date, price, open, high, low" --> INV["Investing.com:<br/>Price is the close, US dates"]
+    LAY -- "date, open, high, low, close" --> GEN["Generic:<br/>UTC dates"]
+    LAY -- "other" --> DE[/"DataError"/]
+    INV --> NUM["parse_number:<br/>commas, K/M/B, percent"]
+    GEN --> NUM
+    NUM --> SORT["Normalise the dates,<br/>sort oldest-first"]
+    SYN --> VAL{"validate:<br/>any error?"}
+    SORT --> VAL
+    VAL -- "yes" --> DE
+    VAL -- "no" --> OUT[/"PriceData: frame, provenance,<br/>warnings, sha256"/]
+```
 
 | Input | Output |
 |---|---|
@@ -241,11 +401,83 @@ flowchart TB
 - A calendar gap is a warning. The return of the next day spans the gap.
 - `CoinbaseSource` asks for 300 days per request and fails on an error payload.
 
+The second diagram shows how `fetch` downloads the candles with `CoinbaseSource`.
+
+```mermaid
+flowchart LR
+    IN[/"start, end, product"/] --> CHK{"end after start?"}
+    CHK -- "no" --> DE[/"DataError"/]
+    CHK -- "yes" --> REQ["GET /products/product/candles<br/>granularity 86400, 300 days"]
+    REQ --> PL{"Answer is a list?"}
+    PL -- "no" --> DE
+    PL -- "yes" --> ADD["Add the candles,<br/>cursor = stop + 1 day"]
+    ADD --> MORE{"cursor before end?"}
+    MORE -- "yes" --> REQ
+    MORE -- "no" --> ANY{"Any candles?"}
+    ANY -- "no" --> DE
+    ANY -- "yes" --> FR["UTC calendar days,<br/>drop duplicate dates, sort"]
+    FR --> EX{"Output file exists<br/>and no --force?"}
+    EX -- "yes" --> DE
+    EX -- "no" --> OUT[("data/raw/btc_usd_coinbase.csv")]
+```
+
+The third diagram shows how `synthetic.generate` makes the synthetic prices.
+
+```mermaid
+flowchart LR
+    IN[/"n_days, seed, signal"/] --> LOOP["For each day t:<br/>GARCH variance from r of day t − 1"]
+    LOOP --> SIG{"signal above 0 and<br/>t above the window?"}
+    SIG -- "yes" --> MU["drift = signal × Gini of the last 30<br/>absolute returns − 0.45, clipped, × sigma"]
+    SIG -- "no" --> ZERO["drift = 0"]
+    MU --> R["r = drift + sigma × noise,<br/>+ a jump with a 3 % chance"]
+    ZERO --> R
+    R -. "next day" .-> LOOP
+    R --> OHLC["close = exp of the cumulative r,<br/>then open, high, low, volume"]
+    OHLC --> OUT[/"Daily OHLCV from 2017-01-01"/]
+```
+
 ---
 
 ## 6. Features and targets
 
 **Purpose.** Make inputs that use only the past, and targets that are in the future.
+
+The first diagram shows how `build_features` and `make_target` make the table.
+
+```mermaid
+flowchart LR
+    C[/"close, high, low<br/>of each day"/] --> R["r of day t =<br/>log close t − log close t−1"]
+    R --> LAG["ret_lag1, ret_lag2,<br/>ret_lag3, ret_lag5"]
+    R --> ROLL["ret_7d, vol_7, vol_30,<br/>skew_30, kurt_30"]
+    C --> RNG["range_log =<br/>log of high / low"]
+    R --> ABS["absolute r"]
+    ABS --> GK["rolling_gini_kolkata:<br/>last window days"]
+    GK --> GINI["gini_abs_ret,<br/>kolkata_abs_ret"]
+    GINI --> CH["gini_change_7"]
+    C --> TGT["make_target: y_h of day t =<br/>log close t+h − log close t"]
+    LAG --> TAB[/"Feature table by date,<br/>NaN in warm-up rows"/]
+    ROLL --> TAB
+    RNG --> TAB
+    GINI --> TAB
+    CH --> TAB
+    TGT --> TS[/"Target series y_hd,<br/>last h rows NaN"/]
+```
+
+The second diagram shows how `features/inequality.py` calculates the two indices for one window.
+
+```mermaid
+flowchart TD
+    IN[/"Absolute returns from day<br/>t − window + 1 to day t"/] --> NANC{"A NaN in the window?"}
+    NANC -- "yes" --> NAN[/"Gini and Kolkata are NaN"/]
+    NANC -- "no" --> SORT["Sort the values"]
+    SORT --> TOT{"Total = 0?"}
+    TOT -- "yes" --> EQ[/"Gini 0, Kolkata 0.5"/]
+    TOT -- "no" --> LOR["Lorenz curve:<br/>cumulative share L of p"]
+    LOR --> G["Gini = 2 Σ i x_i / n total<br/>− n + 1 / n"]
+    LOR --> K["Kolkata: the p where L = 1 − p,<br/>linear interpolation"]
+    G --> OUT[/"gini_abs_ret and<br/>kolkata_abs_ret at day t"/]
+    K --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -280,6 +512,27 @@ flowchart TB
 
 **Purpose.** Measure each model on days that it did not see, with the same days for every model.
 
+The first diagram shows how `run_study` runs all horizons, models and feature sets.
+
+```mermaid
+flowchart TD
+    IN[/"PriceData, Settings, models"/] --> FE["build_features one time"]
+    FE --> H["For each horizon h:<br/>make_target"]
+    H --> M["For each model"]
+    M --> FS{"Model uses<br/>all features?"}
+    FS -- "yes: ridge, gbm" --> TWO["Feature sets:<br/>base and base+inequality"]
+    FS -- "no: random_walk, mean, ar" --> ONE["Feature set: base only"]
+    TWO --> MASK["Set NaN where a feature<br/>of the union is missing"]
+    ONE --> MASK
+    MASK --> WF["walk_forward"]
+    WF --> SUM["summarize:<br/>one accuracy row"]
+    WF --> BTQ{"h = 1 and model<br/>not random_walk?"}
+    BTQ -- "yes" --> BT["backtest_sign"]
+    SUM --> AB["After all models: ablation DM<br/>for each model with both sets"]
+    AB --> OUT[/"StudyResult: rows,<br/>ablation, backtests"/]
+    BT --> OUT
+```
+
 | Input | Output |
 |---|---|
 | The feature table, one target, a model and a feature set | A `WalkForwardResult`: dates, realised targets, predictions and the refit log |
@@ -287,10 +540,28 @@ flowchart TB
 **Procedure**
 
 1. Keep the days with complete features (union of all feature sets) and an observed target.
-2. Use the first `min_train` usable days for the first fit.
+2. Use the first `min_train` usable days for the first fit. For h above 1, the embargo removes the last h − 1 of these days.
 3. At each refit day, train on the usable days t with t + h on or before the refit day.
 4. Predict the next `refit_every` days with that model.
 5. Repeat to the end of the series.
+
+The second diagram shows the loop of `walk_forward` for one model, one feature set and one horizon.
+
+```mermaid
+flowchart TD
+    IN[/"features, target, model, h,<br/>min_train, refit_every"/] --> COLS["columns_for:<br/>ar uses ret_lag1 to ret_lag3"]
+    COLS --> US["Usable rows: complete features,<br/>observed target"]
+    US --> ENOUGH{"More usable rows<br/>than min_train?"}
+    ENOUGH -- "no" --> VE[/"ValueError"/]
+    ENOUGH -- "yes" --> O1["First origin:<br/>usable row number min_train"]
+    O1 --> BLK["Block: usable rows from the origin<br/>to origin + refit_every − 1"]
+    BLK --> EMB["Training rows: usable rows<br/>with t on or before origin − h"]
+    EMB --> FIT["Clone the ModelSpec factory,<br/>fit"]
+    FIT --> PR["Predict the block,<br/>record the Refit"]
+    PR --> NX{"Test rows left?"}
+    NX -- "yes, next origin" --> BLK
+    NX -- "no" --> OUT[/"WalkForwardResult: dates,<br/>y_true, y_pred, refits"/]
+```
 
 **Rules**
 
@@ -306,6 +577,20 @@ flowchart TB
 | `ridge` | Ridge regression, alpha chosen by internal CV from 13 values (0.01 to 10,000) |
 | `gbm` | Histogram gradient boosting: depth 3, rate 0.03, 150 iterations, at least 40 days per leaf |
 
+The third diagram shows how `models.py` makes each model from its name.
+
+```mermaid
+flowchart LR
+    SPEC[/"get_model: model name"/] --> KIND{"MODELS"}
+    KIND -- "random_walk" --> RW["RandomWalk:<br/>predicts 0"]
+    KIND -- "mean" --> HM["HistoricalMean:<br/>mean training return"]
+    KIND -- "ar, ridge, gbm" --> PIPE["Pipeline: SimpleImputer median,<br/>StandardScaler, model"]
+    PIPE --> AR["ar: LinearRegression"]
+    PIPE --> RG["ridge: RidgeCV,<br/>13 alphas, 0.01 to 10,000"]
+    PIPE --> GB["gbm: HistGradientBoostingRegressor,<br/>depth 3, rate 0.03, 150 iterations"]
+    KIND -- "other name" --> VE[/"ValueError"/]
+```
+
 ---
 
 ## 8. The metrics, the tests and the backtest
@@ -314,7 +599,7 @@ flowchart TB
 |---|---|---|
 | MAE, RMSE | Errors of the predicted log return | Lower |
 | R² vs RW | 1 - SSE(model) / SSE(zero forecast) | Above 0 |
-| Direction accuracy | Share of days with the correct sign (zero predictions are skipped) | Above 0.5 |
+| Direction accuracy | Share of days with the correct sign (zero predictions and zero returns are skipped) | Above 0.5 |
 | DM vs RW | Diebold-Mariano statistic for squared errors. Positive = the model has a smaller loss | Positive, with p < 0.05 |
 | Ablation DM | Same test, base+inequality against base, same model, same days | Positive, with p < 0.05 |
 
@@ -325,6 +610,22 @@ flowchart TB
 | p-value | Two-sided, t distribution with n - 1 degrees of freedom |
 | Multiple comparisons | Not adjusted. The report says so |
 
+The diagram shows how `diebold_mariano` compares two forecasts on the same days.
+
+```mermaid
+flowchart TD
+    IN[/"y, model prediction,<br/>reference prediction, h"/] --> D["d_t = reference squared error<br/>− model squared error"]
+    D --> LRV["Long-run variance: gamma0<br/>+ 2 × autocovariances to lag h − 1"]
+    LRV --> NEG{"Variance 0 or less?"}
+    NEG -- "yes" --> G0["Use gamma0"]
+    NEG -- "no" --> DM["DM = mean of d /<br/>square root of variance / n"]
+    G0 --> Z{"gamma0 = 0?"}
+    Z -- "yes" --> NULL[/"statistic 0, p-value 1"/]
+    Z -- "no" --> DM
+    DM --> HLN["Harvey-Leybourne-Newbold<br/>correction factor"]
+    HLN --> P[/"statistic and two-sided p-value,<br/>t with n − 1 df"/]
+```
+
 | Backtest rule | Value in the code |
 |---|---|
 | Horizon | 1 day only |
@@ -332,6 +633,20 @@ flowchart TB
 | Cost | `BTCGINI_COST_BPS` basis points per unit change of the position (default 10) |
 | Annualisation | 365 days |
 | Reference | Buy and hold on the same days |
+
+The diagram shows how `backtest_sign` calculates the strategy returns.
+
+```mermaid
+flowchart LR
+    IN[/"1-day targets y,<br/>predictions p, cost_bps"/] --> POS{"long_only?"}
+    POS -- "no, default" --> S["position = sign of p:<br/>+1, 0 or −1"]
+    POS -- "yes" --> L["position = 1 if p above 0,<br/>else 0"]
+    S --> CH["change = absolute change<br/>of the position"]
+    L --> CH
+    CH --> RET["return = position × simple return<br/>− change × cost_bps / 10,000"]
+    RET --> OUT[/"total log return, annual return and volatility,<br/>Sharpe, max drawdown, turnover, hit rate"/]
+    IN --> BH[/"Buy and hold: log return<br/>and Sharpe on the same days"/]
+```
 
 ---
 
@@ -396,6 +711,41 @@ pytest -q
 | `btc-gini-signal evaluate` | Runs the walk-forward study and writes the report (`--models`, `--horizons`, `--min-train`, `--refit-every`, `--cost-bps`) |
 | `btc-gini-signal forecast` | Prints a direct forecast for each horizon from the last day |
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> DEMO["btc-gini-signal demo<br/>synthetic prices"]
+    INS --> FETCH["btc-gini-signal fetch"]
+    INS --> SYN["btc-gini-signal synth"]
+    FETCH --> RAW[("data/raw/*.csv")]
+    SYN --> RAW
+    RAW --> VAL["btc-gini-signal validate"]
+    RAW --> FEAT["btc-gini-signal features"]
+    FEAT --> PROC[("data/processed/features.csv")]
+    RAW --> EVAL["btc-gini-signal evaluate"]
+    EVAL --> OUT[("outputs/report.md<br/>outputs/results.json")]
+    DEMO --> OUT
+    RAW --> FC["btc-gini-signal forecast"]
+    FC --> TERM[/"Forecast table<br/>in the terminal"/]
+```
+
+The diagram shows how `forecast` makes a direct forecast with `direct_forecast`.
+
+```mermaid
+flowchart TD
+    IN[/"PriceData, horizons,<br/>model, feature set"/] --> FE["build_features"]
+    FE --> LAST{"Last day has<br/>complete features?"}
+    LAST -- "no" --> VE[/"ValueError"/]
+    LAST -- "yes" --> H["For each horizon h"]
+    H --> TR["Training rows: complete features<br/>and an observed h-day target"]
+    TR --> N{"50 rows or more?"}
+    N -- "no" --> VE
+    N -- "yes" --> FIT["Fit one model for h"]
+    FIT --> PR["Predict from the last day:<br/>log return, last close × exp of it"]
+    PR --> OUT[/"origin_date, target_date,<br/>predicted_log_return, predicted_close"/]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -411,6 +761,18 @@ pytest -q
 | `BTCGINI_COST_BPS` | backtest | Cost in basis points per unit turnover (default 10) |
 
 btc-gini-signal uses no credentials. A local `.env` file is optional, and git ignores it.
+
+```mermaid
+flowchart LR
+    DOT[/".env file"/] --> MERGE["Settings.from_env:<br/>.env first, the environment wins"]
+    ENV[/"Process environment"/] --> MERGE
+    MERGE --> CHK{"Integer, number and<br/>minimum checks pass?"}
+    CHK -- "no" --> ERR[/"ConfigError:<br/>error: and exit code 2"/]
+    CHK -- "yes" --> SET["Settings"]
+    FLAG[/"CLI options: --seed, --horizons, --window,<br/>--min-train, --refit-every, --cost-bps"/] --> OVR["with_overrides:<br/>a given option wins"]
+    SET --> OVR
+    OVR --> FINAL[/"Settings of the command"/]
+```
 
 ---
 
